@@ -83,7 +83,6 @@ bool fTxIndex = false;
 bool fHavePruned = false;
 bool fPruneMode = false;
 bool fIsBareMultisigStd = DEFAULT_PERMIT_BAREMULTISIG;
-bool fRequireStandard = true;
 unsigned int nBytesPerSigOp = DEFAULT_BYTES_PER_SIGOP;
 bool fCheckBlockIndex = false;
 bool fCheckpointsEnabled = DEFAULT_CHECKPOINTS_ENABLED;
@@ -269,18 +268,19 @@ void UpdatePreferredDownload(CNode *node, CNodeState *state)
     nPreferredDownload += state->fPreferredDownload;
 }
 
-void InitializeNode(NodeId nodeid, const CNode *pnode)
+void InitializeNode(const CNode *pnode)
 {
+    // Add an entry to the nodestate map
     LOCK(cs_main);
-    CNodeState &state = mapNodeState.insert(std::make_pair(nodeid, CNodeState())).first->second;
-    state.name = pnode->addrName;
-    state.address = pnode->addr;
+    mapNodeState.emplace_hint(mapNodeState.end(), std::piecewise_construct, std::forward_as_tuple(pnode->GetId()),
+        std::forward_as_tuple(pnode->addr, std::move(pnode->addrName)));
 }
 
 void FinalizeNode(NodeId nodeid)
 {
     LOCK(cs_main);
     CNodeState *state = State(nodeid);
+    DbgAssert(state != nullptr, return );
 
     if (state->fSyncStarted)
         nSyncStarted--;
@@ -331,8 +331,8 @@ bool GetNodeStateStats(NodeId nodeid, CNodeStateStats &stats)
 
     LOCK(cs_main);
     CNodeState *state = State(nodeid);
-    if (state == NULL)
-        return false;
+    DbgAssert(state != nullptr, return false);
+
     stats.nMisbehavior = node->nMisbehavior;
     stats.nSyncHeight = state->pindexBestKnownBlock ? state->pindexBestKnownBlock->nHeight : -1;
     stats.nCommonHeight = state->pindexLastCommonBlock ? state->pindexLastCommonBlock->nHeight : -1;
@@ -718,13 +718,14 @@ bool AcceptToMemoryPoolWorker(CTxMemPool &pool,
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
+    const CChainParams &chainparams = Params();
+    bool fRequireStandard = chainparams.RequireStandard();
     if (fRequireStandard && !IsStandardTx(tx, reason))
         return state.DoS(0, false, REJECT_NONSTANDARD, reason);
 
     // Don't relay version 2 transactions until CSV is active, and we can be
     // sure that such transactions will be mined (unless we're on
     // -testnet/-regtest).
-    const CChainParams &chainparams = Params();
     if (fRequireStandard && tx.nVersion >= 2 &&
         VersionBitsTipState(chainparams.GetConsensus(), Consensus::DEPLOYMENT_CSV) != THRESHOLD_ACTIVE)
     {
@@ -2511,6 +2512,18 @@ void static UpdateTip(CBlockIndex *pindexNew)
             {
                 AlertNotify(strMiscWarning);
                 fWarned = true;
+            }
+        }
+        else
+        {
+            // clear warning in case unknown block version descrease under 50% of the last 100 mined blocks
+            if (fWarned &&
+                strMiscWarning ==
+                    _("Warning: Unknown block versions being mined! It's possible unknown rules are in effect"))
+            {
+                strMiscWarning = "";
+                AlertNotify(strMiscWarning);
+                fWarned = false;
             }
         }
     }
@@ -5333,16 +5346,17 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
             if (fListen && !IsInitialBlockDownload())
             {
                 CAddress addr = GetLocalAddress(&pfrom->addr);
+                FastRandomContext insecure_rand;
                 if (addr.IsRoutable())
                 {
                     LOG(NET, "ProcessMessages: advertising address %s\n", addr.ToString());
-                    pfrom->PushAddress(addr);
+                    pfrom->PushAddress(addr, insecure_rand);
                 }
                 else if (IsPeerAddrLocalGood(pfrom))
                 {
                     addr.SetIP(pfrom->addrLocal);
                     LOG(NET, "ProcessMessages: advertising address %s\n", addr.ToString());
-                    pfrom->PushAddress(addr);
+                    pfrom->PushAddress(addr, insecure_rand);
                 }
             }
 
@@ -5488,6 +5502,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
         std::vector<CAddress> vAddrOk;
         int64_t nNow = GetAdjustedTime();
         int64_t nSince = nNow - 10 * 60;
+        FastRandomContext insecure_rand;
         BOOST_FOREACH (CAddress &addr, vAddr)
         {
             boost::this_thread::interruption_point();
@@ -5524,7 +5539,7 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
                     int nRelayNodes = fReachable ? 2 : 1; // limited relaying of addresses outside our network(s)
                     for (std::multimap<uint256, CNode *>::iterator mi = mapMix.begin();
                          mi != mapMix.end() && nRelayNodes-- > 0; ++mi)
-                        ((*mi).second)->PushAddress(addr);
+                        ((*mi).second)->PushAddress(addr, insecure_rand);
                 }
             }
             // Do not store addresses outside our network
@@ -6461,8 +6476,9 @@ bool ProcessMessage(CNode *pfrom, std::string strCommand, CDataStream &vRecv, in
 
         pfrom->vAddrToSend.clear();
         std::vector<CAddress> vAddr = addrman.GetAddr();
+        FastRandomContext insecure_rand;
         BOOST_FOREACH (const CAddress &addr, vAddr)
-            pfrom->PushAddress(addr);
+            pfrom->PushAddress(addr, insecure_rand);
     }
 
 
@@ -6996,7 +7012,7 @@ bool SendMessages(CNode *pto)
         // If a sync has been started check whether we received the first batch of headers requested within the timeout
         // period. If not then disconnect and ban the node and a new node will automatically be selected to start the
         // headers download.
-        if ((state.fSyncStarted) && (state.fSyncStartTime < GetTime() - INITIAL_HEADERS_TIMEOUT) &&
+        if ((state.fSyncStarted) && (state.nSyncStartTime < GetTime() - INITIAL_HEADERS_TIMEOUT) &&
             (!state.fFirstHeadersReceived) && !pto->fWhitelisted)
         {
             pto->fDisconnect = true;
@@ -7030,7 +7046,7 @@ bool SendMessages(CNode *pto)
                 if (pindexStart->nHeight < pto->nStartingHeight)
                 {
                     state.fSyncStarted = true;
-                    state.fSyncStartTime = GetTime();
+                    state.nSyncStartTime = GetTime();
                     state.fFirstHeadersReceived = false;
                     state.fRequestedInitialBlockAvailability = true;
                     state.nFirstHeadersExpectedHeight = pindexBestHeader->nHeight;
@@ -7205,6 +7221,7 @@ bool SendMessages(CNode *pto)
         // Message: inventory
         //
 
+        FastRandomContext insecure_rand;
         std::vector<CInv> vInvWait;
         std::vector<CInv> vInvSend;
         {
@@ -7244,7 +7261,7 @@ bool SendMessages(CNode *pto)
                         if (fSendTrickle)
                         {
                             // 1/4 of tx invs blast to all immediately
-                            if ((insecure_rand() & 3) != 0)
+                            if ((insecure_rand.rand32() & 3) != 0)
                             {
                                 vInvWait.push_back(inv);
                                 continue;
@@ -7273,26 +7290,10 @@ bool SendMessages(CNode *pto)
             }
         }
 
-        // In case there is a block that has been in flight from this peer for 2 + 0.5 * N times the block interval
-        // (with N the number of peers from which we're downloading validated blocks), disconnect due to timeout.
-        // We compensate for other peers to prevent killing off peers due to our own downstream link
-        // being saturated. We only count validated in-flight blocks so peers can't advertise non-existing block hashes
-        // to unreasonably increase our timeout.
-        if (!pto->fDisconnect && state.vBlocksInFlight.size() > 0)
-        {
-            QueuedBlock &queuedBlock = state.vBlocksInFlight.front();
-            int nOtherPeersWithValidatedDownloads =
-                requester.nPeersWithValidatedDownloads - (state.nBlocksInFlightValidHeaders > 0);
-            if (nNow > state.nDownloadingSince +
-                           consensusParams.nPowTargetSpacing *
-                               (BLOCK_DOWNLOAD_TIMEOUT_BASE +
-                                   BLOCK_DOWNLOAD_TIMEOUT_PER_PEER * nOtherPeersWithValidatedDownloads))
-            {
-                LOGA(
-                    "Timeout downloading block %s from peer=%d, disconnecting\n", queuedBlock.hash.ToString(), pto->id);
-                pto->fDisconnect = true;
-            }
-        }
+
+        // Check for block download timeout and disconnect node if necessary
+        requester.CheckForDownloadTimeout(pto, state, consensusParams, nNow);
+
 
         //
         // Message: getdata (blocks)
