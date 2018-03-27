@@ -2,6 +2,8 @@
 
 [![Build Status](https://travis-ci.org/BitcoinUnlimited/BitcoinUnlimited.svg?branch=dev)](https://travis-ci.org/BitcoinUnlimited/BitcoinUnlimited)
 
+This was forked by Darren Tapp for study of the giga_pref branch.
+
 What is Bitcoin?
 =====================================
 
