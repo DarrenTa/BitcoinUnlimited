@@ -1,6 +1,8 @@
 Bitcoin Core integration/staging tree
 =====================================
 
+This was forked by Darren Tapp for study of the giga_pref branch.
+
 [![Build Status](https://travis-ci.org/bitcoin/bitcoin.svg?branch=master)](https://travis-ci.org/bitcoin/bitcoin)
 
 https://www.bitcoin.org
